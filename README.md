@@ -20,6 +20,9 @@ This knowledge is hard to find through official channels because it is fragmente
 
 ---
 
+<img src='' title='Video Walkthrough' width='' alt='Video Walkthrough' />
+
+
 ## Document Sources
 
 <!-- List every source you collected documents from.
