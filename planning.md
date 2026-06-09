@@ -238,3 +238,83 @@ flowchart TD
 - *Input I'll give it:* the **Grounded Generation** requirements (from the README), the `retrieve()` function, and my desired UI (Gradio or Streamlit per `requirements.txt`).
 - *What I expect it to produce:* a `generate(query)` that calls a Groq LLM with a **grounding system prompt** (answer only from the supplied context; if the context doesn't contain the answer, say so; cite the source of each claim), formats the retrieved chunks as labeled context, and returns an answer with source attribution — wrapped in a simple query UI.
 - *How I'll verify:* run all 5 evaluation questions end-to-end, checking each answer matches the expected answer and cites the correct source; then test an **out-of-domain** question (e.g. "What's the best pizza in Chicago?") to confirm the model refuses rather than hallucinating.
+
+---
+
+## Stretch Features (Extra Credit)
+
+> Per the project brief, each stretch feature is specced here *before* its code is written.
+
+### A. Hybrid Search (BM25 + semantic)
+
+**Goal:** Combine dense semantic retrieval (the existing ChromaDB cosine search) with sparse lexical retrieval (BM25) and compare the fused ranking to semantic-only on the 5 evaluation questions.
+
+**Why it should help this corpus:** Semantic search is strong on paraphrase ("primary driver" ≈ "what drives spending") but weak on rare exact tokens — country names, acronyms, and specific figures. My hardest question is **Q4** (U.S. vs. Belgium % of GDP), where the dense neighborhood is flooded by ~500 near-identical OECD records and the literal token "Belgium" / "United States" never surfaces the right pair. BM25 rewards documents that contain the query's exact rare terms, so the templated record *"In 2022, Belgium spent 10.74% of GDP on health"* should rank highly for a query naming Belgium. Fusing the two signals is the standard fix.
+
+**Design:**
+- **Sparse:** A small pure-Python **BM25 (Okapi)** index built over the same `chunks.jsonl` corpus — no new dependency. Tokenize on lowercased word characters; standard `k1=1.5, b=0.75`.
+- **Dense:** the existing `retrieve()` path (MiniLM + ChromaDB cosine).
+- **Fusion:** **Reciprocal Rank Fusion (RRF)**, `score = Σ 1/(rrf_k + rank)`, `rrf_k=60`. RRF is rank-based, so it needs no score normalization between the two very different scales (cosine similarity vs. BM25 term scores). Each retriever contributes a candidate pool; fused list is truncated to top-k. The existing per-source diversity cap is applied **after** fusion.
+- **API:** `hybrid.py` exposing `search(query, k, mode)` where `mode ∈ {"semantic", "bm25", "hybrid"}`, so the comparison harness and the app can switch modes through one entry point.
+
+**How I'll compare / verify:** `compare_search.py` runs all 5 questions through `mode="semantic"` and `mode="hybrid"`, and reports, per question, whether each question's **gold source_id(s)** appear in top-k and at what rank. Gold sources: Q1 `kff_employer_survey`, Q2 `peterson_drivers`, Q3 `investopedia_6reasons`, Q4 `who_usa`+`oecd_health_expenditure`, Q5 `commonwealth_global`. Success = hybrid recovers ≥ as many gold sources as semantic-only, with the expectation that Q4 improves.
+
+> **Result:** Both modes recover **5/6** gold sources (83% recall@5). Hybrid improved **Q2** (`peterson_drivers` rank 3 → 2) by rewarding the literal token "drives/driver". The remaining miss is **Q4's `who_usa` chunk** — under *both* modes the per-source cap fills the comparison with OECD records and the Commonwealth/Peterson briefs before the WHO U.S. profile ranks; BM25 didn't rescue it because the WHO profile phrases its figure as "Current health expenditure (% of GDP) 17.36" rather than naming "United States" near the number. So hybrid is a modest, honest win (better Q2 rank, no regressions) rather than a fix for the known Q4 cross-source gap, which remains documented rather than over-tuned.
+
+### B. Chunking Strategy Comparison
+
+**Goal:** Hold the corpus, embedding model, and retrieval identical and vary *only* the prose chunker, to test whether the planning.md choice (~800 char / ~120 overlap, sentence-aware) is actually the best of several options on the 5-question retrieval task.
+
+**Strategies compared (prose path only; the atomic record/ranking chunks are held fixed because they are the controlled variable's complement, not under test):**
+1. `sentence_400_60` — small sentence-aware chunks (~100 tokens). Tighter topical focus, but a multi-sentence comparative claim may split across a boundary.
+2. `sentence_800_120` — **the current production strategy** (~200 tokens, ~15% overlap, sentence-aware).
+3. `fixed_1600_0` — naive fixed 1600-char windows, no sentence boundaries, no overlap. Deliberately exceeds MiniLM's ~1024-char / 256-token ceiling to show **silent truncation** degrading retrieval — the exact failure the production size was chosen to avoid.
+
+**Method:** `compare_chunking.py` rebuilds chunks under each strategy (reusing the real `chunk_prose` logic with swapped size params for 1 & 2, and a fixed-window splitter for 3), embeds each set into a fresh **in-memory** ChromaDB collection with the same MiniLM model, and runs the 5 questions through the identical top-k + per-source-cap retrieval. It reports per strategy: chunk count, avg/max chunk chars, and **gold-source recall@k** (same gold set as Feature A).
+
+**How I'll judge "which performed better and why":** highest recall@k wins; ties broken by better (lower) average gold rank. The hypothesis under test is that `sentence_800_120` ≥ the alternatives, and specifically that `fixed_1600_0` loses recall because over-long chunks are truncated to 256 tokens at embedding time, dropping the tail text that some answers live in.
+
+> **Result:**
+>
+> | strategy | chunks | prose avg chars | recall@k | avg gold rank |
+> |---|---|---|---|---|
+> | sentence_400_60 | 2173 | 328 | 5/6 | 1.6 |
+> | **sentence_800_120** (prod) | 1391 | 702 | 5/6 | **1.4** |
+> | fixed_1600_0 | 967 | 1574 | 5/6 | 1.4 |
+>
+> **Winner: `sentence_800_120`** — all three recover the same 5/6 gold sources, so the production size wins on the tiebreak (best average gold rank, 1.4) while being the most precise: the small 400-char chunks dropped **Q3** from rank 1 → 2 (splitting Investopedia's "4× drug prices" takeaway away from its surrounding context), confirming the boundary-split risk that motivated the ~200-token / ~15%-overlap choice.
+>
+> **Honest caveat:** `fixed_1600_0` did *not* visibly collapse on this question set despite exceeding MiniLM's 256-token limit — its truncation is harmless *here* only because each answer's key sentence happens to sit near the **start** of its chunk (which is what survives truncation). It remains the wrong default: it embeds only the first ~256 tokens of a 1600-char window (silently discarding the rest), yields coarse chunks that mix topics, and would fail the moment an answer lived in a chunk's tail. The comparison validates the production choice on *precision and safety*, not on a dramatic recall gap — which is the honest finding.
+
+### C. Metadata Filtering
+
+**Goal:** Let a user constrain retrieval to a subset of the corpus by **document source** and by **publication year** (the project's "filter by source / date / rating" — this corpus has no ratings, so source + year are the meaningful axes; the "reviews from the past year" example maps to a min-year cutoff).
+
+**What metadata exists:** every chunk already carries `source_id`, `source`, `year`, and `kind` (set in `config.SOURCES` and stored in ChromaDB). So filtering needs no re-indexing — only a query-time predicate.
+
+**Design — one filter spec, applied uniformly across all three search modes:**
+- `filters = {"source_ids": [...], "min_year": int|None, "max_year": int|None}`.
+- **Semantic path:** translate the spec into a ChromaDB `where` clause (`$in` on `source_id`, `$gte`/`$lte` on `year`, combined with `$and`) so filtering happens inside the vector query — not as a post-hoc trim that could empty out top-k.
+- **BM25 path:** the same spec becomes a Python predicate applied to candidate chunks before scoring.
+- This lives in `hybrid.py` so Features A + C compose: a filtered hybrid search just passes both `mode` and `filters`.
+
+**UI:** the Gradio app gains a **source multiselect** (all 11 sources, empty = all) and a **"published since" year** control, plus a **search-mode** selector (semantic / bm25 / hybrid). Generation runs over only the filtered, retrieved chunks, so citations stay honest to the user's constraints.
+
+**How I'll verify:** (1) a source-restricted query (e.g. limit to `oecd_health_expenditure`) returns only OECD chunks; (2) a `min_year=2025` filter excludes WHR-2000 (year 2000) and the 2024 Peterson drivers brief; (3) an over-tight filter that matches nothing degrades gracefully to "not enough information" rather than erroring.
+
+> **Result:** All three verified. (1) returns only `oecd_health_expenditure` rows; (2) the `min_year=2025` set contained only 2025–2026 sources (`peterson_compare` 2026, `commonwealth_global` 2026, `investopedia_6reasons` 2025) — the 2024 drivers brief and year-2000 WHR were correctly excluded; (3) the impossible `min_year=3000` filter returned `[]`, which the generator turns into the standard "not enough information" refusal.
+
+### D. Conversational Memory (multi-turn)
+
+**Goal:** Support follow-up questions that depend on earlier turns — e.g. *"What share of GDP does the U.S. spend on health?"* → *"How does that compare to Belgium?"* → *"And which spends more per person?"* — where the later questions are elliptical ("that", "which") and would retrieve nothing useful on their own.
+
+**The core problem:** retrieval is stateless — embedding *"how does that compare to Belgium?"* finds chunks about the word "compare", not about U.S. health spending. So memory has to act **before** retrieval, not just in the prompt.
+
+**Design — history-aware query condensation:**
+1. The Gradio chat already threads `history` (prior user/assistant turns) into the handler.
+2. Before retrieving, if history is non-empty, a lightweight Groq call **rewrites the latest message into a standalone question** using the conversation so far (a "condense question" step, the standard conversational-RAG pattern). *"How does that compare to Belgium?"* → *"How does U.S. health spending as a share of GDP compare to Belgium?"* If the message is already self-contained, it is returned unchanged.
+3. The **standalone** query drives retrieval (so Features A + C still apply), and the final grounded-answer prompt also receives a short transcript of recent turns for conversational fluency — while the grounding rules (answer only from retrieved context, refuse otherwise) are unchanged.
+
+**Why a separate condense step rather than just dumping history into one prompt:** retrieval quality is the bottleneck. Stuffing raw history into the generation prompt doesn't help the retriever find the right chunks; rewriting the query does. Keeping condense and answer as two calls also keeps the grounding prompt clean and auditable.
+
+**How I'll verify:** run the three-turn sequence above and confirm (a) the condensed query logged for turn 2 names "U.S." and "GDP" (not just "Belgium"), (b) turn 2's retrieved chunks include the OECD/Belgium record, and (c) a fresh first-turn question with empty history skips the condense call and behaves exactly as the single-turn app did.
