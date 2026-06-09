@@ -21,7 +21,7 @@ This knowledge is hard to find through official channels because it is fragmente
 ---
 
 https://share.vidyard.com/watch/Tm5fP6n5ynBGnZeBEqPh5Y
-<img src='' title='Video Walkthrough' width='' alt='Video Walkthrough' />
+
 
 
 ## Document Sources
